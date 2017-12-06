@@ -3,7 +3,7 @@ import multiprocessing
 from multiprocessing import Process, Queue, Lock, cpu_count
 import threading
 import os
-import time
+import time, datetime
 import Image
 import pyexiv2
 import cv2
@@ -42,6 +42,7 @@ class myAlprProcessing (multiprocessing.Process):
     self.alprQueueLock = alprQueueLock
     self.aliyunWorkQueue = aliyunWorkQueue
     self.aliyunQueueLock = aliyunQueueLock
+    self.bucket = oss2.Bucket(oss2.Auth(os.getenv('OSS2_ACCESS_KEY_ID'), os.getenv('OSS2_ACCESS_KEY_SECRET')), 'http://oss-cn-qingdao.aliyuncs.com', 'runffphoto')
     self.debug = debug
 
   def run(self):
@@ -79,10 +80,12 @@ class myAlprProcessing (multiprocessing.Process):
           alpr.unload()
           # Post process
           self.run_postProcess(key, filePath, recognizeResults)
-          # En aliyun upload queue
+            # En aliyun upload queue
           aliyunQueueLock.acquire()
           aliyunWorkQueue.put(key)
           aliyunQueueLock.release()
+          # Delete temp image file
+          os.remove(filePath)
       else:
         alprQueueLock.release()
         time.sleep(1)
@@ -91,7 +94,7 @@ class myAlprProcessing (multiprocessing.Process):
     filePath = ''
     try:
       filePath = ALPR_IMAGES_TEMP_FILE + os.path.basename(key)
-      bucket.get_object_to_file(key, filePath)
+      self.bucket.get_object_to_file(key, filePath)
     except:
       print 'download failed, key=' + key
     return filePath
@@ -134,66 +137,41 @@ class myAlprProcessing (multiprocessing.Process):
 
 #key upload/photos/ocr/ing/1169/b827eb047cb3_dsc_4755_1472680_08c1afcbdb19a38a7064570d53570768.jpg
   def run_postProcess(self, key, filePath, recognizeResults):
+    plateValidation = False
     try:
-      # Result Sanity Check and find the result
-      result = ''
-      try:
-        for plate in recognizeResults:
-          plateString = ''
-          plateConfidence = 0
-          for candidates in plate['candidates']:
-            if candidates['matches_template'] == 1:
-              plateString = candidates['plate']
-              plateConfidence = candidates['confidence']
-              break
-          if plateConfidence == 0 and float(plate['confidence']) > postprocess_min_confidence:
-              plateString = plate['plate']
-              plateConfidence = plate['confidence']
-          if plateConfidence != 0:
-            plateList = list(plateString)
-            plateIndex = 0
-            for plateCharacter in plateList:
-              if plateIndex == 0:
-                if plateCharacter == "8":
-                  plateList[plateIndex] = "B"
-                else:
-                  if plateCharacter == "Z" or plateCharacter == "z":
-                    plateList[plateIndex] = "1"
-                  elif plateCharacter == "J" or plateCharacter == "j":
-                    plateList[plateIndex] = "1"
-              plateIndex += 1
-            plateString = "".join(plateList)
-            result += plateString + '_' + str(plateConfidence) + '\n'
-      except:
-        print recognizeResults
-        print 'recognizeResults failed, key=' + key
-      # Save to file
+      jsonString = json.dumps(recognizeResults)
       resultKey = key.replace(aliyun_images, aliyun_images_result, 1)
       resultKey = resultKey.replace('.jpg', '.txt', 1)
       resultKeyFile = ALPR_RESULT_BUFFER + os.path.basename(resultKey)
-      # Write result to file
-      file_object = open(resultKeyFile, 'w')
-      try:
-        file_object.write(result)
-      finally:
-        file_object.close()
       # Copy file for debug purpose
       if self.debug == 1:
-        jsonString = json.dumps(recognizeResults)
         if len(jsonString) > 2:
-          print 'jsonString len ' + str(len(jsonString))
-          jsonString = jsonString + '\n' + result
-          debugKeyFile = ALPR_DEBUG_FLODER + os.path.basename(resultKey)
+          debugKeyFile = os.path.join(ALPR_DEBUG_FLODER, str(datetime.date.today())[0:10])
+          if not os.path.exists(debugKeyFile):
+            os.mkdir(debugKeyFile)
+          debugKeyFile = os.path.join(debugKeyFile, os.path.basename(resultKey))
           debugKeyFile = debugKeyFile.replace('.txt', '.log', 1)
           file_object = open(debugKeyFile, 'w')
           try:
             file_object.write(jsonString)
           finally:
             file_object.close()
+      # Result Sanity Check and find the result
+      for plate in recognizeResults:
+        for candidates in plate['candidates']:
+          if candidates['matches_template'] == 1:
+            plateValidation = True
+            break
+      if plateValidation == True:
+        # Save to file
+        # Write result to file
+        file_object = open(resultKeyFile, 'w')
+        try:
+          file_object.write(jsonString)
+        finally:
+          file_object.close()
     except:
       print 'run_postProcess failed, key=' + key
-    # Delete temp image file
-    os.remove(filePath)
 
 ################################
 class myAliyunProcessing(threading.Thread):
@@ -214,22 +192,23 @@ class myAliyunProcessing(threading.Thread):
         key = self.aliyunWorkQueue.get()
         self.aliyunQueueLock.release()
         # Upload result
-        self.run_uploadResult(self.bucket, key)
+        self.run_uploadResult(key)
       else:
         self.aliyunQueueLock.release()
         time.sleep(1)
 
-  def run_uploadResult(self, bucket, key):
+  def run_uploadResult(self, key):
     try:
       resultKey = key.replace(aliyun_images, aliyun_images_result, 1)
       resultKey = resultKey.replace('.jpg', '.txt', 1)
       resultKeyFile = ALPR_RESULT_BUFFER + os.path.basename(resultKey)
-      bucket.put_object_from_file(resultKey, resultKeyFile)
-      print "Delete local file " + resultKeyFile
-      os.remove(resultKeyFile)
+      if os.path.exists(resultKeyFile):
+        self.bucket.put_object_from_file(resultKey, resultKeyFile)
+        print "Delete local file " + resultKeyFile
+        os.remove(resultKeyFile)
       # Destory File
       print "Delete Aliyun " + key
-      bucket.delete_object(key)
+      self.bucket.delete_object(key)
     except:
       print 'run_uploadResult failed, key=' + key
 
@@ -238,8 +217,10 @@ class myAliyunProcessing(threading.Thread):
 def clearBuffer():
   if not os.path.exists(ALPR_IMAGES_TEMP_FILE):
     os.mkdir(ALPR_IMAGES_TEMP_FILE)
+    os.chmod(ALPR_IMAGES_TEMP_FILE, stat.S_IRWXO|stat.S_IRWXG|stat.S_IRWXU)
   if not os.path.exists(ALPR_RESULT_BUFFER):
     os.mkdir(ALPR_RESULT_BUFFER)
+    os.chmod(ALPR_RESULT_BUFFER, stat.S_IRWXO|stat.S_IRWXG|stat.S_IRWXU)
   ## Ramdisk create by /etc/rc.local
   os.system("rm -rf " + ALPR_IMAGES_TEMP_FILE + "*")
   ## Result file
