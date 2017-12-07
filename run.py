@@ -258,11 +258,10 @@ def run_fileLoad(workQueue, queueLock):
 
 def main_func():
   ## Start subTask
-  alprThreadNum = cpu_count()*2
+  alprThreadNum = cpu_count()*3
   alprThreads = []
   alprWorkQueue = Queue()
   alprQueueLock = Lock()
-  aliyunThreadNum = 28
   aliyunThreads = []
   aliyunWorkQueue = Queue()
   aliyunQueueLock = Lock()
